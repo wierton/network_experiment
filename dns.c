@@ -37,12 +37,33 @@ struct Q_SEC {
 
 struct R_SEC {
 	/*char NAME[]; uncertain length*/
-	uint32_t type;
-	uint32_t class;
+	uint16_t type;
+#define RR_TYPE_A		1 //a host address
+#define RR_TYPE_NS		2 //an authoritative name server
+#define RR_TYPE_MD		3 //a mail destination (Obsolete - use MX)
+#define RR_TYPE_MF		4 //a mail forwarder (Obsolete - use MX)
+#define RR_TYPE_CNAME	5 //the canonical name for an alias
+#define RR_TYPE_SOA		6 //marks the start of a zone of authority
+#define RR_TYPE_MB		7 //a mailbox domain name (EXPERIMENTAL)
+#define RR_TYPE_MG		8 //a mail group member (EXPERIMENTAL)
+#define RR_TYPE_MR		9 //a mail rename domain name(EXPERIMENTAL)
+#define RR_TYPE_NUL		10 //a null RR (EXPERIMENTAL)
+#define RR_TYPE_WKS		11 //a well known service description
+#define RR_TYPE_PTR		12 //a domain name pointer
+#define RR_TYPE_HINFO	13 //host information
+#define RR_TYPE_MINFO	14 //mailbox or mail list information
+#define RR_TYPE_MX		15 //mail exchange
+#define RR_TYPE_TXT		16 //text strings
+	uint16_t class;
+#define CLASS_IN 1 //the Internet
+#define CLASS_CS 2 //the CSNET class (Obsolete - used only for examples in some obsolete RFCs)
+#define CLASS_CH 3 //the CHAOS class
+#define CLASS_HS 4 //Hesiod [Dyer 87]
 	uint32_t ttl;
 	uint16_t rdlength;
 	struct in_addr raddr;
-};
+}__attribute__((packed));
+
 
 void hexdump(const char *buf, int len) {
 	int i, j;
@@ -91,14 +112,14 @@ char *convert_domain_name_to_stream(const char *name) {
 	return raw_domain;
 }
 
-char *read_domain_name_from_stream(const char *stream) {
+char *read_domain_name_from_stream(const char *section_start) {
 	int i, p=0, q=0;
 	static char domain_name[256];
-	for(;stream[q];) {
-		for(i=(uint8_t)stream[q++];i;i--) {
-			domain_name[p++]=stream[q++];
+	for(;section_start[q];) {
+		for(i=(uint8_t)section_start[q++];i;i--) {
+			domain_name[p++]=section_start[q++];
 		}
-		domain_name[p++] = stream[q]?'.':'\0';
+		domain_name[p++] = section_start[q]?'.':'\0';
 	}
 	return domain_name;
 }
@@ -133,12 +154,51 @@ int contruct_request_stream(char *buf, char *domain_name) {
 void dumps_response_stream(const char *buf) {
 	struct DNS_HEADER *dns_header = (void *)buf;
 	dns_header->qdcount = ntohs(dns_header->qdcount);
+	dns_header->ancount = ntohs(dns_header->ancount);
 
-	void *section_start = (void*)buf + sizeof(struct DNS_HEADER);
-	printf("%s", read_domain_name_from_stream(section_start));
-	struct R_SEC *response_section = section_start + strlen(section_start) + 1;
-	printf(" ipv%d ", ntohs(response_section->rdlength)/4);
-	printf("%s\n", inet_ntoa(response_section->raddr));
+	switch(dns_header->rcode) {
+		case 0:break;
+		case 1:printf("format error\n");return;
+		case 2:printf("server failure\n");return;
+		case 3:printf("no such domain name\n");return;
+		case 4:printf("server hasn't implemented this function\n");return;
+		case 5:printf("server refused to answer.\n");return;
+	}
+
+	char *section_start = (char*)buf + sizeof(struct DNS_HEADER);
+
+	/*ignore request content*/
+	for(int i = dns_header->qdcount; i>0; i--) {
+		section_start += strlen(section_start) + 1 + 2 + 2;
+	}
+
+	/*response record*/
+	for(int i = dns_header->ancount; i>0; i--) {
+		uint8_t domain_length = 0;
+		char *domain_start = section_start;
+
+		if((section_start[0]&0xc0)==0xc0) { 
+			domain_start = (void*)buf+section_start[1];
+			domain_length = 2;
+		} else {
+			domain_length = strlen(domain_start) + 1;
+		}
+		printf("%s", read_domain_name_from_stream(domain_start));
+		struct R_SEC *response_section = (void*)section_start + domain_length;
+		section_start += domain_length + sizeof(struct R_SEC);
+
+		if(ntohs(response_section->type) == RR_TYPE_A) {
+			printf(" ipv%d ", ntohs(response_section->rdlength));
+			printf("%s\n", inet_ntoa(response_section->raddr));
+		}
+
+		if(ntohs(response_section->type) == RR_TYPE_CNAME) {
+			domain_start = (void*)&response_section->raddr;
+			domain_length = strlen(domain_start) + 1;
+			printf("\t[CNAME]\n");
+			section_start += domain_length - sizeof(response_section->raddr);
+		}
+	}
 }
 
 const uint8_t test_req[] = {
@@ -149,7 +209,7 @@ const uint8_t test_req[] = {
 	0x00, 0x01
 };
 
-int main() {
+int main(int argc, char *argv[]) {
     int len;
 	const int BUFSIZE = 1000;
     int client_sockfd;
@@ -158,7 +218,8 @@ int main() {
 	int addr_len = sizeof(struct sockaddr_in);
 
     remote_addr.sin_family=AF_INET;
-    remote_addr.sin_addr.s_addr=inet_addr("114.212.11.66");
+    //remote_addr.sin_addr.s_addr=inet_addr("114.212.11.66");
+    remote_addr.sin_addr.s_addr=inet_addr("8.8.8.8");
     remote_addr.sin_port=htons(53);
 
     if((client_sockfd=socket(AF_INET,SOCK_DGRAM,0))<0) {
@@ -166,19 +227,16 @@ int main() {
         return -1;
     }
 
-	int stream_length = contruct_request_stream(buf, "www.bilibili.com");
+	/*dns query*/
+	for(int i = 1; i < argc; i++) {
+		int stream_length = contruct_request_stream(buf, argv[i]);
+		sendto(client_sockfd, buf, stream_length, 0, (struct sockaddr *)&remote_addr, addr_len);
 
-	bufdump(buf, stream_length, "send %d bytes, dumps data:\n", stream_length);
-/*
-	printf("captured by wireshark:\n");
-	hexdump(test_req, sizeof(test_req));
-	printf("--------------------------------------\n");
-*/
-	sendto(client_sockfd, buf, stream_length, 0, (struct sockaddr *)&remote_addr, addr_len);
-	//len=sendto(client_sockfd, test_req, sizeof(test_req), 0, (struct sockaddr *)&remote_addr, addr_len);
-	len=recvfrom(client_sockfd, buf, BUFSIZE, 0, (struct sockaddr *)&remote_addr, &addr_len);
-	bufdump(buf, len, "recv %d bytes, dumps data:\n", len);
-	dumps_response_stream(buf);
+		len=recvfrom(client_sockfd, buf, BUFSIZE, 0, (struct sockaddr *)&remote_addr, &addr_len);
+		//bufdump(buf, len, "recv %d bytes, dumps data:\n", len);
+		dumps_response_stream(buf);
+	}
+
     close(client_sockfd);
 
 	return 0;
